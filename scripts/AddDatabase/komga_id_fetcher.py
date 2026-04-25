@@ -6,14 +6,14 @@ import sys
 import re
 from pathlib import Path
 
-# 路径加载保持不变
+# 路径加载
 def add_config_to_path():
     p = Path(__file__).resolve()
     for parent in p.parents:
         if (parent / "configs").exists():
             sys.path.append(str(parent / "configs"))
             return
-    print("[!] 找不到 configs 目录")
+    sys.path.append(str(Path("Z:/comic_tools/configs")))
 
 add_config_to_path()
 import config
@@ -21,60 +21,42 @@ import config
 class KomgaIDFetcher:
     def __init__(self):
         self.db_path = config.SYNC_DB_PATH
-        self.host = config.KOMGA_HOST
+        self.host = config.KOMGA_HOST.rstrip('/')
         self.auth = (config.KOMGA_USER, config.KOMGA_PASS)
         self.session = requests.Session()
         self.session.auth = self.auth
-
-    def wait_for_komga_idle(self, timeout=300, interval=5):
-        """轮询 Komga 任务队列，直到所有任务完成"""
-        print("[*] 正在监控 Komga 后台任务...")
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                # 获取待处理任务数量
-                resp = self.session.get(f"{self.host}/api/v1/tasks")
-                if resp.status_code == 200:
-                    task_count = resp.json().get('count', 0)
-                    if task_count == 0:
-                        print("[√] Komga 已空闲，准备开始同步。")
-                        return True
-                    print(f"    [等待] 尚有 {task_count} 个任务在队列中...")
-                else:
-                    print(f"[!] 无法获取任务状态: {resp.status_code}")
-            except Exception as e:
-                print(f"[X] 轮询异常: {e}")
-            
-            time.sleep(interval)
-        
-        print("[!] 轮询超时，Komga 可能仍在忙碌，尝试直接同步。")
-        return False
+        # 增加标准请求头
+        self.session.headers.update({"Accept": "application/json"})
 
     def trigger_scan(self):
-        """指令 Komga 扫描库文件"""
-        print("[*] 指令 Komga 扫描所有库...")
+        """指令 Komga 扫描所有库"""
+        print("[*] 指令 Komga 扫描所有库...", flush=True)
         try:
-            response = self.session.get(f"{self.host}/api/v1/libraries")
+            response = self.session.get(f"{self.host}/api/v1/libraries", timeout=10)
             if response.status_code == 200:
                 libs = response.json()
                 for lib in libs:
                     self.session.post(f"{self.host}/api/v1/libraries/{lib['id']}/scan")
                 return True
         except Exception as e:
-            print(f"[X] 触发扫描失败: {e}")
+            print(f"[X] 触发扫描失败: {e}", flush=True)
         return False
 
     def get_all_books_map(self):
-        """分页获取所有书籍并建立 GID -> KID 映射"""
+        r"""
+        基于固定路径深度提取 GID：
+        路径结构示例: Z:\Komga\38\3745952\[38]xxx.cbz
+        拆分后倒数第 2 位永远是 GID 文件夹名
+        """
         komga_map = {}
         page = 0
-        size = 200 # 适中的单页大小
+        size = 500
         
-        print("[*] 正在从 API 抓取书籍元数据...")
+        print("[*] 正在从 API 抓取书籍元数据并解析目录结构...", flush=True)
         while True:
             url = f"{self.host}/api/v1/books?page={page}&size={size}"
             try:
-                resp = self.session.get(url)
+                resp = self.session.get(url, timeout=20)
                 if resp.status_code != 200: break
                 
                 data = resp.json()
@@ -82,57 +64,91 @@ class KomgaIDFetcher:
                 if not books: break
                 
                 for b in books:
-                    # 这里的正则建议根据你的实际路径结构微调
-                    gid_match = re.search(r'[/\\](\d+)[/\\]', b['url'])
-                    if gid_match:
-                        komga_map[gid_match.group(1)] = b['id']
+                    file_url = b['url']
+                    # 使用斜杠或反斜杠拆分路径，并过滤掉空字符串
+                    parts = [p for p in re.split(r'[/\\]', file_url) if p]
+                    
+                    # 根据你的路径结构：
+                    # parts[-1] 是文件名 (如: [38]xxx.cbz)
+                    # parts[-2] 是 GID 文件夹 (如: 3745952)
+                    if len(parts) >= 2:
+                        gid = parts[-2]
+                        # 只有当倒数第二级目录全是数字时才认为是有效的 GID
+                        if gid.isdigit():
+                            komga_map[gid] = b['id']
+                        else:
+                            # 调试用：如果这一层不是数字，说明目录结构可能超出了预期
+                            # print(f"    [跳过] 路径结构异常: {file_url}")
+                            pass
                 
                 if data.get('last') is True: break
                 page += 1
             except Exception as e:
-                print(f"[X] 分页抓取异常 (Page {page}): {e}")
+                print(f"[X] API 抓取异常: {e}", flush=True)
                 break
         
         return komga_map
 
-    def fetch_and_update(self):
-        """执行 SQL 更新"""
+    def check_and_update(self):
+        """执行一次对账更新，并返回当前数据库中仍然缺失 KID 的数量"""
         komga_map = self.get_all_books_map()
         if not komga_map:
-            print("[X] 未能获取到任何有效的 Komga 映射数据。")
-            return
+            return -1 # 表示获取失败
 
-        print(f"[*] 映射建立完成，捕获到 {len(komga_map)} 条有效路径 ID。")
-        
         try:
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             
-            cursor.execute("SELECT gid, komga_id, title FROM sync_master")
+            # 1. 尝试更新
+            cursor.execute("SELECT gid, komga_id FROM sync_master")
             rows = cursor.fetchall()
             
             updated_count = 0
             for row in rows:
-                gid = str(row['gid']) # 确保类型一致
+                gid = str(row['gid'])
                 if gid in komga_map:
                     new_kid = komga_map[gid]
                     if row['komga_id'] != new_kid:
                         cursor.execute("UPDATE sync_master SET komga_id = ? WHERE gid = ?", (new_kid, gid))
                         updated_count += 1
-                        # print(f"    [KID 更新] GID {gid}: {new_kid}")
-
+            
             conn.commit()
+            
+            # 2. 查询还剩多少个空坑
+            cursor.execute("SELECT COUNT(*) FROM sync_master WHERE komga_id IS NULL OR komga_id = ''")
+            missing_count = cursor.fetchone()[0]
+            
             conn.close()
-            print(f"[√] KID 同步完成。共更新 {updated_count} 条记录。")
+            return missing_count
         except Exception as e:
-            print(f"[X] 数据库操作异常: {e}")
+            print(f"[X] 数据库操作异常: {e}", flush=True)
+            return -1
 
     def run(self):
-        if self.trigger_scan():
-            # 关键改进：等待任务完成而非固定延时
-            self.wait_for_komga_idle()
-            self.fetch_and_update()
+        if not self.trigger_scan():
+            return
+
+        print("[*] 扫描已触发，进入数据对账循环（10s/次）...", flush=True)
+        max_attempts = 3600  # 安全阈值：最多等 60 分钟，防止有文件永远扫不出来导致死循环
+        attempt = 0
+
+        while attempt < max_attempts:
+            attempt += 1
+            missing = self.check_and_update()
+            
+            if missing == 0:
+                print(f"[√] 所有书籍 ID 已同步完成。", flush=True)
+                break
+            elif missing == -1:
+                print("    [!] 数据读取异常，稍后重试...", flush=True)
+            else:
+                print(f"    [循环 {attempt}] 还有 {missing} 本书尚未抓取到 ID，等待 Komga 录入...", flush=True)
+            
+            time.sleep(10)
+        
+        if attempt >= max_attempts:
+            print("[!] 到达最大等待时间，部分书籍可能未被 Komga 正确识别。", flush=True)
 
 if __name__ == "__main__":
     KomgaIDFetcher().run()
