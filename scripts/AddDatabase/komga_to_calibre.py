@@ -1,18 +1,24 @@
 # -*- coding: utf-8 -*-
 import sqlite3
-import os, re, zipfile, subprocess, sys
+import os, re, zipfile, subprocess, sys, time
 from pathlib import Path
 
-def add_config_to_path():
+# 1. 环境配置 (统一双修路径)
+def init_environment():
     p = Path(__file__).resolve()
     for parent in p.parents:
-        if (parent / "configs").exists():
-            sys.path.append(str(parent / "configs"))
+        configs_dir = parent / "configs"
+        sql_edit_dir = parent / "scripts" / "SQLEdit"
+        if configs_dir.exists(): sys.path.append(str(configs_dir))
+        if sql_edit_dir.exists():
+            sys.path.append(str(sql_edit_dir))
             return
-    print("[!] 找不到 configs 目录")
+    sys.path.append(str(Path("Z:/comic_tools/configs")))
+    sys.path.append(str(Path("Z:/comic_tools/scripts/SQLEdit")))
 
-add_config_to_path()
+init_environment()
 import config
+from db_locker import SQLiteLock # 导入全局通行证
 
 class KomgaToCalibre:
     def __init__(self):
@@ -26,36 +32,53 @@ class KomgaToCalibre:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # 只查找没有 calibre_id 的项目
-        cursor.execute("SELECT * FROM sync_master WHERE calibre_id IS NULL OR calibre_id = 'null'")
-        items = cursor.fetchall()
+        # --- 步骤 1：获取待处理列表 (受保护的读取) ---
+        with SQLiteLock():
+            cursor.execute("SELECT * FROM sync_master WHERE calibre_id IS NULL OR calibre_id = 'null'")
+            items = cursor.fetchall()
+
+        if not items:
+            print("[√] 没有需要入库 Calibre 的项目。")
+            return
 
         for info in items:
             gid = info['gid']
             komga_path = info['komga_path']
             if not komga_path or not os.path.exists(komga_path): continue
 
-            print(f"[*] 准备入库 Calibre: GID {gid}")
+            print(f"[*] 准备入库 Calibre: GID {gid} | {info['title'][:25]}...")
+            
+            # --- 步骤 2：建立临时缓冲 CBZ ---
+            # 采用 .tmp 后缀防止 calibredb 读到正在写入的文件
+            temp_cbz_staging = os.path.join(config.TEMP_XML_DIR, f"k2c_tmp_{gid}.cbz.tmp")
+            temp_cbz_final = os.path.join(config.TEMP_XML_DIR, f"k2c_tmp_{gid}.cbz")
+            
             try:
-                # 1. 提取元数据
-                temp_cbz = os.path.join(config.TEMP_XML_DIR, f"calibre_tmp_{gid}.cbz")
+                # 从 Komga 源文件提取 ComicInfo 和 第一张图（用于封面）
                 with zipfile.ZipFile(komga_path, 'r') as src_zf:
                     xml_data = src_zf.read("ComicInfo.xml").decode('utf-8')
                     img_list = sorted([n for n in src_zf.namelist() if n.lower().endswith(('.jpg', '.jpeg', '.png', '.webp', '.avif'))])
-                    with zipfile.ZipFile(temp_cbz, 'w', zipfile.ZIP_STORED) as dst_zf:
+                    
+                    with zipfile.ZipFile(temp_cbz_staging, 'w', zipfile.ZIP_STORED) as dst_zf:
                         dst_zf.writestr("ComicInfo.xml", xml_data)
-                        if img_list: dst_zf.writestr(img_list[0], src_zf.read(img_list[0]))
+                        if img_list: 
+                            dst_zf.writestr(img_list[0], src_zf.read(img_list[0]))
+                
+                # 原子重命名
+                if os.path.exists(temp_cbz_final): os.remove(temp_cbz_final)
+                os.rename(temp_cbz_staging, temp_cbz_final)
 
-                # 2. 调用 Calibre
+                # --- 步骤 3：调用 Calibre (耗时操作，不占锁) ---
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(xml_data)
                 cmd = [
-                    config.CALIBREDB_EXE, "add", temp_cbz,
+                    config.CALIBREDB_EXE, "add", temp_cbz_final,
                     "--with-library", config.TARGET_DIR,
                     "--authors", root.findtext('Artist', 'Unknown'),
                     "--title", root.findtext('Title', 'Unknown'),
                     "--tags", root.findtext('Tags', ''),
-                    "--series", root.findtext('Title', 'Unknown'), "--duplicates"
+                    "--series", root.findtext('Title', 'Unknown'), 
+                    "--duplicates"
                 ]
                 res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
                 
@@ -63,15 +86,23 @@ class KomgaToCalibre:
                     cid_match = re.search(r'id:?\s*(\d+)', res.stdout + res.stderr, re.IGNORECASE)
                     new_cid = cid_match.group(1) if cid_match else "null"
                     
-                    # 3. 精准回填 CID
-                    cursor.execute("UPDATE sync_master SET calibre_id = ? WHERE gid = ?", (new_cid, gid))
-                    conn.commit()
+                    # --- 步骤 4：回填 CID (受保护的写入) ---
+                    with SQLiteLock():
+                        cursor.execute("UPDATE sync_master SET calibre_id = ? WHERE gid = ?", (new_cid, gid))
+                        conn.commit()
                     print(f"      [√] 入库成功! CID: {new_cid}")
-                
-                if os.path.exists(temp_cbz): os.remove(temp_cbz)
+                else:
+                    print(f"      [X] Calibre 拒绝入库: {res.stderr}")
+
+                # 清理
+                if os.path.exists(temp_cbz_final): os.remove(temp_cbz_final)
+
             except Exception as e:
-                print(f"      [X] 失败: {e}")
+                print(f"      [X] 流程中断: {e}")
+                if os.path.exists(temp_cbz_staging): os.remove(temp_cbz_staging)
 
         conn.close()
+        print("[*] K2C 同步任务结束。")
 
-if __name__ == '__main__': KomgaToCalibre().run()
+if __name__ == '__main__': 
+    KomgaToCalibre().run()
