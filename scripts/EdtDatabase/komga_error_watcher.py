@@ -66,7 +66,7 @@ class KomgaErrorWatcher:
         # 1. 先报一次家底
         self.print_existing_errors()
         
-        print(f"[*] 错误监控后台启动，巡检间隔: {self.check_interval}s", flush=True)
+        print(f"[*] Komga 错误监控已挂载，每 {self.check_interval}s 扫描一次 API", flush=True)
         while True:
             try:
                 current_errors = self.get_komga_errors()
