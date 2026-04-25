@@ -34,12 +34,11 @@ class FolderInspector:
         self.error_list = self.load_errors()
 
     def init_db(self):
-        """数据库架构升级：以 gid 为核心"""
+        """数据库架构升级：增加增量更新逻辑"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        # 创建主索引表
-        # Primary Key 变更为 gid
-        # 新增 translate_tag 和 raw_tag 字段
+        
+        # 1. 确保基础表存在 (保持最原始的结构)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sync_master (
                 gid TEXT PRIMARY KEY,
@@ -55,6 +54,23 @@ class FolderInspector:
                 raw_tag TEXT DEFAULT ''
             )
         ''')
+
+        # 2. 动态检查并增加新字段 (解决语法错误并兼容旧表)
+        # 我们不再依赖 CREATE TABLE 更新，而是手动 ALTER TABLE
+        new_columns = [
+            ("komga_status", "TEXT DEFAULT 'READY'"),
+            ("komga_error", "TEXT DEFAULT ''")
+        ]
+
+        for col_name, col_def in new_columns:
+            try:
+                # 尝试增加字段，如果字段已存在，SQLite 会抛出异常，我们 catch 住即可
+                cursor.execute(f"ALTER TABLE sync_master ADD COLUMN {col_name} {col_def}")
+                print(f"    [架构更新] 成功增加字段: {col_name}")
+            except sqlite3.OperationalError:
+                # 错误信息通常是 "duplicate column name"，说明已经加过了，直接跳过
+                pass
+
         conn.commit()
         conn.close()
 
