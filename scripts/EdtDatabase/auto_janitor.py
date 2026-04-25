@@ -3,16 +3,29 @@ import os, sys, sqlite3, shutil, subprocess, time
 from pathlib import Path
 
 # 环境配置加载
-def add_config_to_path():
+def init_environment():
     p = Path(__file__).resolve()
+    # 向上寻找项目根目录 (即包含 configs 或 scripts 的目录)
     for parent in p.parents:
-        if (parent / "configs").exists():
-            sys.path.append(str(parent / "configs"))
-            return
-    sys.path.append(str(Path("Z:/comic_tools/configs")))
+        configs_dir = parent / "configs"
+        sql_edit_dir = parent / "scripts" / "SQLEdit" # 路径：scripts/SQLEdit
+        
+        # 如果找到了 configs 目录，添加它
+        if configs_dir.exists():
+            sys.path.append(str(configs_dir))
+        
+        # 如果找到了 SQLEdit 目录，添加它
+        if sql_edit_dir.exists():
+            sys.path.append(str(sql_edit_dir))
+            return # 关键路径都找到了，退出循环
 
-add_config_to_path()
+    # --- 兜底逻辑：如果自动化寻找失败，手动指定 Z 盘路径 ---
+    sys.path.append(str(Path("Z:/comic_tools/configs")))
+    sys.path.append(str(Path("Z:/comic_tools/scripts/SQLEdit")))
+
+init_environment()
 import config
+from db_locker import SQLiteLock  # 现在你可以直接这样导出了！
 
 # 延续原来的安全锁逻辑
 LOCK_FILE = os.path.join(os.path.dirname(config.SYNC_DB_PATH), ".lock")
@@ -80,9 +93,6 @@ class AutoJanitor:
         print(f"    [√] 数据库记录已注销")
 
     def run_cycle(self):
-        if not self._acquire_lock():
-            print("[!] 维护锁存在，跳过本次循环", flush=True)
-            return
 
         print(f"[*] {time.strftime('%Y-%m-%d %H:%M:%S')} 开启自动化巡逻与维护...", flush=True)
         jh_conn = self.prepare_jhentai_snapshot()
@@ -93,37 +103,38 @@ class AutoJanitor:
         jh_gids = self.get_active_gids(jh_conn.cursor())
         jh_conn.close()
 
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+        with SQLiteLock(): # 这里会自动排队等候，不需要手动 acquire 和 release
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
 
-            # 这里的逻辑是以 JHenTai 为第一标准进行对账
-            cursor.execute("SELECT gid, folder_name, title, calibre_id, komga_path FROM sync_master")
-            items = cursor.fetchall()
+                # 这里的逻辑是以 JHenTai 为第一标准进行对账
+                cursor.execute("SELECT gid, folder_name, title, calibre_id, komga_path FROM sync_master")
+                items = cursor.fetchall()
 
-            destroyed_count = 0
-            for item in items:
-                gid = str(item['gid'])
-                folder_name = item['folder_name']
-                
-                # 安全保护逻辑核心：JHenTai 没了 且 物理源文件夹也没了
-                source_path = os.path.join(config.SOURCE_DIR, folder_name)
-                if gid not in jh_gids and not os.path.exists(source_path):
-                    self.execute_destruction(item, cursor)
-                    destroyed_count += 1
+                destroyed_count = 0
+                for item in items:
+                    gid = str(item['gid'])
+                    folder_name = item['folder_name']
+                    
+                    # 安全保护逻辑核心：JHenTai 没了 且 物理源文件夹也没了
+                    source_path = os.path.join(config.SOURCE_DIR, folder_name)
+                    if gid not in jh_gids and not os.path.exists(source_path):
+                        self.execute_destruction(item, cursor)
+                        destroyed_count += 1
 
-            conn.commit()
-            conn.close()
-            if destroyed_count > 0:
-                print(f"[*] 本轮清理完毕，共移除 {destroyed_count} 个死项。", flush=True)
-            else:
-                print("[√] 库状态健康，未发现待处理项。", flush=True)
+                conn.commit()
+                conn.close()
+                if destroyed_count > 0:
+                    print(f"[*] 本轮清理完毕，共移除 {destroyed_count} 个死项。", flush=True)
+                else:
+                    print("[√] 库状态健康，未发现待处理项。", flush=True)
 
-        except Exception as e:
-            print(f"[X] 自动维护异常: {e}", flush=True)
-        finally:
-            self._release_lock()
+            except Exception as e:
+                print(f"[X] 自动维护异常: {e}", flush=True)
+            finally:
+                self._release_lock()
 
     def start(self):
         print(f"[*] 自动化清理服务已就绪，运行周期: {self.interval}s (约 {self.interval//60} 分钟)", flush=True)

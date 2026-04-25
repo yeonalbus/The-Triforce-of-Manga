@@ -7,16 +7,29 @@ import re
 from pathlib import Path
 
 # 路径加载
-def add_config_to_path():
+def init_environment():
     p = Path(__file__).resolve()
+    # 向上寻找项目根目录 (即包含 configs 或 scripts 的目录)
     for parent in p.parents:
-        if (parent / "configs").exists():
-            sys.path.append(str(parent / "configs"))
-            return
-    sys.path.append(str(Path("Z:/comic_tools/configs")))
+        configs_dir = parent / "configs"
+        sql_edit_dir = parent / "scripts" / "SQLEdit" # 路径：scripts/SQLEdit
+        
+        # 如果找到了 configs 目录，添加它
+        if configs_dir.exists():
+            sys.path.append(str(configs_dir))
+        
+        # 如果找到了 SQLEdit 目录，添加它
+        if sql_edit_dir.exists():
+            sys.path.append(str(sql_edit_dir))
+            return # 关键路径都找到了，退出循环
 
-add_config_to_path()
+    # --- 兜底逻辑：如果自动化寻找失败，手动指定 Z 盘路径 ---
+    sys.path.append(str(Path("Z:/comic_tools/configs")))
+    sys.path.append(str(Path("Z:/comic_tools/scripts/SQLEdit")))
+
+init_environment()
 import config
+from db_locker import SQLiteLock  # 现在你可以直接这样导出了！
 
 class KomgaIDFetcher:
     def __init__(self):
@@ -95,35 +108,37 @@ class KomgaIDFetcher:
         if not komga_map:
             return -1 # 表示获取失败
 
-        try:
-            conn = sqlite3.connect(self.db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            # 1. 尝试更新
-            cursor.execute("SELECT gid, komga_id FROM sync_master")
-            rows = cursor.fetchall()
-            
-            updated_count = 0
-            for row in rows:
-                gid = str(row['gid'])
-                if gid in komga_map:
-                    new_kid = komga_map[gid]
-                    if row['komga_id'] != new_kid:
-                        cursor.execute("UPDATE sync_master SET komga_id = ? WHERE gid = ?", (new_kid, gid))
-                        updated_count += 1
-            
-            conn.commit()
-            
-            # 2. 查询还剩多少个空坑
-            cursor.execute("SELECT COUNT(*) FROM sync_master WHERE komga_id IS NULL OR komga_id = ''")
-            missing_count = cursor.fetchone()[0]
-            
-            conn.close()
-            return missing_count
-        except Exception as e:
-            print(f"[X] 数据库操作异常: {e}", flush=True)
-            return -1
+        with SQLiteLock():
+            try:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                
+                # 1. 尝试更新
+                cursor.execute("SELECT gid, komga_id FROM sync_master")
+                rows = cursor.fetchall()
+                
+                updated_count = 0
+                for row in rows:
+                    gid = str(row['gid'])
+                    if gid in komga_map:
+                        new_kid = komga_map[gid]
+                        if row['komga_id'] != new_kid:
+                            cursor.execute("UPDATE sync_master SET komga_id = ? WHERE gid = ?", (new_kid, gid))
+                            updated_count += 1
+                
+                conn.commit()
+                
+                # 2. 查询还剩多少个空坑
+                cursor.execute("SELECT COUNT(*) FROM sync_master WHERE komga_id IS NULL OR komga_id = ''")
+                missing_count = cursor.fetchone()[0]
+                
+                conn.close()
+                return missing_count
+
+            except Exception as e:
+                print(f"[X] 数据库操作异常: {e}", flush=True)
+                return -1
 
     def run(self):
         if not self.trigger_scan():
