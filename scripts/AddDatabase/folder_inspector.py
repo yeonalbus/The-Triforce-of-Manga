@@ -34,11 +34,11 @@ class FolderInspector:
         self.error_list = self.load_errors()
 
     def init_db(self):
-        """数据库架构升级：增加增量更新逻辑"""
+        """数据库架构升级：增加销毁与更新标记"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # 1. 确保基础表存在 (保持最原始的结构)
+        # 1. 基础表结构
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sync_master (
                 gid TEXT PRIMARY KEY,
@@ -51,24 +51,23 @@ class FolderInspector:
                 calibre_id TEXT DEFAULT NULL,
                 komga_id TEXT DEFAULT NULL,
                 translate_tag TEXT DEFAULT '',
-                raw_tag TEXT DEFAULT ''
+                raw_tag TEXT DEFAULT '',
+                komga_status TEXT DEFAULT 'READY',
+                komga_error TEXT DEFAULT ''
             )
         ''')
 
-        # 2. 动态检查并增加新字段 (解决语法错误并兼容旧表)
-        # 我们不再依赖 CREATE TABLE 更新，而是手动 ALTER TABLE
+        # 2. 动态增加本次维护所需的标记位
         new_columns = [
-            ("komga_status", "TEXT DEFAULT 'READY'"),
-            ("komga_error", "TEXT DEFAULT ''")
+            ("need_destroy", "INTEGER DEFAULT 0"),     # 1 表示建议销毁，0 表示正常
+            ("need_update_tag", "INTEGER DEFAULT 0")   # 1 表示需要更新 Tag，0 表示已同步
         ]
 
         for col_name, col_def in new_columns:
             try:
-                # 尝试增加字段，如果字段已存在，SQLite 会抛出异常，我们 catch 住即可
                 cursor.execute(f"ALTER TABLE sync_master ADD COLUMN {col_name} {col_def}")
-                print(f"    [架构更新] 成功增加字段: {col_name}")
+                print(f"    [架构更新] 增加标记位: {col_name}")
             except sqlite3.OperationalError:
-                # 错误信息通常是 "duplicate column name"，说明已经加过了，直接跳过
                 pass
 
         conn.commit()
