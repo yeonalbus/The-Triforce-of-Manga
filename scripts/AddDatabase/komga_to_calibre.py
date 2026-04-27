@@ -80,6 +80,15 @@ class KomgaToCalibre:
                     "--series", root.findtext('Title', 'Unknown'), 
                     "--duplicates"
                 ]
+
+                # 核心修改：添加 creationflags 以隐藏控制台窗口
+                res = subprocess.run(
+                    cmd, 
+                    capture_output=True, 
+                    text=True, 
+                    encoding='utf-8',
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                )
                 res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
                 
                 if res.returncode == 0:
