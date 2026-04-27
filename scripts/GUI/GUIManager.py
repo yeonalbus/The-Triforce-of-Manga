@@ -66,6 +66,10 @@ class ComicControlApp:
 
         self.window.protocol('WM_DELETE_WINDOW', self.hide_window)
 
+        self.log_dir = Path(config.SYNC_DB_PATH).parent / "logs"
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.MAX_UI_LINES = 20  # 界面显示上限，超过则滚动删除旧行
+
     def setup_layout(self):
         self.window.grid_columnconfigure(1, weight=1)
         self.window.grid_rowconfigure(0, weight=1)
@@ -73,24 +77,30 @@ class ComicControlApp:
         # 1. 左侧导航边栏
         self.sidebar_frame = ctk.CTkFrame(self.window, width=170, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(5, weight=1)
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="COMIC TOOLS", font=ctk.CTkFont(size=18, weight="bold"))
         self.logo_label.grid(row=0, column=0, padx=20, pady=20)
 
-        tabs = ["网关监测", "库健康中心", "增量入库", "专家调试"]
+        # 【修改点 1】将“日志管理”直接加入核心列表，这样它会参与循环自动对齐
+        tabs = ["网关监测", "库健康中心", "增量入库", "专家调试", "日志管理"] 
         self.nav_buttons = {}
         for i, name in enumerate(tabs):
             btn = ctk.CTkButton(self.sidebar_frame, corner_radius=0, height=45, text=name,
                                 fg_color="transparent", text_color=("gray10", "gray90"),
                                 hover_color=("gray70", "gray30"), anchor="w",
                                 command=lambda n=name: self.show_frame(n))
+            # 这里的 row 是 i+1，所以五个按钮占用了 row 1 到 row 5
             btn.grid(row=i+1, column=0, sticky="ew")
             self.nav_buttons[name] = btn
 
+        # 【修改点 2】动态设置弹簧行。i+1 是最后一个按钮，所以让 i+2 成为伸缩空间
+        # 这样 i+1 之前的按钮都会紧凑排列，而多余的空间会留给退出按钮上方
+        self.sidebar_frame.grid_rowconfigure(len(tabs) + 1, weight=1)
+
         self.exit_btn = ctk.CTkButton(self.sidebar_frame, text="退出系统", fg_color="#8B0000", hover_color="#660000",
                                      command=self.quit_app)
-        self.exit_btn.grid(row=6, column=0, padx=20, pady=20, sticky="ew")
+        # 【修改点 3】将退出按钮放在弹簧行之后
+        self.exit_btn.grid(row=len(tabs) + 2, column=0, padx=20, pady=20, sticky="ew")
 
         # 2. 内容容器
         self.container = ctk.CTkFrame(self.window, fg_color="transparent")
@@ -106,6 +116,7 @@ class ComicControlApp:
         self.setup_health_content()
         self.setup_incremental_content()
         self.setup_debug_content()
+        self.setup_log_viewer_content()
 
     # --- 1. 网关监测 ---
     def setup_gateway_content(self):
@@ -134,7 +145,7 @@ class ComicControlApp:
             script_path = _SCRIPTS_DIR / "Network/jump_gateway.py"
             self.processes[key] = self._safe_popen([sys.executable, "-u", str(script_path)])
             self.gw_btn.configure(text="关闭网关服务", fg_color="#8B0000")
-            threading.Thread(target=self.read_logs_to_widget, args=(key, self.gw_log), daemon=True).start()
+            threading.Thread(target=self.read_logs_to_widget, args=(key, self.gw_log, "gateway"), daemon=True).start()
         else:
             self.processes[key].terminate()
             self.processes[key] = None
@@ -202,7 +213,7 @@ class ComicControlApp:
             self.processes[key] = self._safe_popen([sys.executable, "-u", str(full_path)])
             self.health_indicators[key].configure(text_color="#00FF00") 
             btn.configure(text="停止服务", fg_color="#8B0000")
-            threading.Thread(target=self.read_logs_to_widget, args=(key, self.health_logs[key]), daemon=True).start()
+            threading.Thread(target=self.read_logs_to_widget, args=(key, self.health_logs[key], key), daemon=True).start()
         else:
             self.processes[key].terminate()
             self.processes[key] = None
@@ -234,6 +245,7 @@ class ComicControlApp:
         ctk.CTkButton(f, text="重置步骤", font=("Arial", 11), width=100, command=self.reset_steps).pack(pady=5)
 
     def run_pipeline(self):
+        self.inc_log.delete("0.0", "end")
         def _pipe():
             self.log_to(self.inc_log, "==== 开启全自动同步流水线 ====")
             for name, path in self.pipeline_steps:
@@ -271,6 +283,9 @@ class ComicControlApp:
     def reset_steps(self):
         self.current_step_index = 0
         self.next_step_btn.configure(text=f"开始：异常扫描", state="normal")
+        # 重置时清空
+        self.inc_log.delete("0.0", "end")
+        self.log_to(self.inc_log, ">>> 步骤已重置，显示区已清空")
 
     # --- 4. 专家调试 ---
     def setup_debug_content(self):
@@ -315,12 +330,15 @@ class ComicControlApp:
 
     def run_once(self, script_path):
         full_path = _SCRIPTS_DIR / script_path
+        script_name = os.path.basename(script_path).replace(".py", "")
+        
         def _task():
-            self.log_to(self.debug_log, f">>> 触发单次执行: {os.path.basename(script_path)}")
+            # 记录到 debug 专用的持久化文件
+            self.log_to(self.debug_log, f">>> 触发单次执行: {script_name}", log_file_name="debug_tools")
             # 这里统一使用 subprocess 执行，不带额外 args [cite: 29]
             self.current_task_proc = self._safe_popen([sys.executable, "-u", str(full_path)])
             for line in iter(self.current_task_proc.stdout.readline, ''):
-                self.log_to(self.debug_log, f"    {line.strip()}")
+                self.log_to(self.debug_log, f"    {line.strip()}", log_file_name="debug_tools")
             if self.current_task_proc:
                 self.current_task_proc.wait() # [cite: 30]
             self.current_task_proc = None
@@ -337,11 +355,37 @@ class ComicControlApp:
         self.active_subprocesses.append(proc) # [cite: 10]
         return proc
 
-    def log_to(self, text_widget, message):
+    def log_to(self, text_widget, message, log_file_name=None):
+        timestamp = time.strftime('%H:%M:%S')
+        formatted_msg = f"[{timestamp}] {message}\n"
+
+        # 1. 如果需要持久化，写入物理文件
+        if log_file_name:
+            date_str = time.strftime('%Y-%m-%d')
+            file_path = self.log_dir / f"{log_file_name}_{date_str}.log"
+            try:
+                with open(file_path, "a", encoding="utf-8") as f:
+                    f.write(formatted_msg)
+            except: pass
+
+        # 2. 线程安全地更新 UI
         def _write():
-            text_widget.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+            if not text_widget.winfo_exists(): return
+            
+            # 插入新内容
+            text_widget.insert("end", formatted_msg)
+            
+            # 检查行数并清理 (关键优化)
+            # 获取当前行数（index 'end' 返回 "line.char" 格式）
+            line_count = int(text_widget.index('end-1c').split('.')[0])
+            if line_count > self.MAX_UI_LINES:
+                # 删除从第一行到溢出部分的文本，保持总量在 MAX_UI_LINES
+                delete_until = float(line_count - self.MAX_UI_LINES + 1)
+                text_widget.delete("1.0", f"{delete_until}.0")
+            
             text_widget.see("end")
-        self.window.after(0, _write) # [cite: 11]
+
+        self.window.after(0, _write)
 
     def interrupt_task(self, log_widget):
         if self.current_task_proc and self.current_task_proc.poll() is None:
@@ -355,11 +399,12 @@ class ComicControlApp:
         for btn_name, btn in self.nav_buttons.items():
             btn.configure(fg_color="transparent" if btn_name != name else "gray30")
 
-    def read_logs_to_widget(self, key, widget):
+    def read_logs_to_widget(self, key, widget, log_name):
         proc = self.processes[key]
         if proc:
             for line in iter(proc.stdout.readline, ''):
-                self.log_to(widget, line.strip())
+                # 将对应的服务 key 作为文件名
+                self.log_to(widget, line.strip(), log_file_name=log_name)
 
     def create_tray_icon(self):
         img = Image.new('RGB', (64, 64), color=(73, 109, 137))
@@ -380,6 +425,77 @@ class ComicControlApp:
             except: pass
         self.window.destroy()
         os._exit(0)
+
+    # --- 5. 日志管理 (全量回溯) ---
+    def setup_log_viewer_content(self):
+        tab = self.tab_frames["日志管理"]
+        tab.grid_columnconfigure(1, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # 左侧控制栏
+        f = ctk.CTkFrame(tab, fg_color="transparent", width=260)
+        f.grid(row=0, column=0, sticky="ns", pady=20)
+        
+        # 右侧全量日志显示区
+        self.viewer_log = ctk.CTkTextbox(tab, border_width=1, font=("Consolas", 11))
+        self.viewer_log.grid(row=0, column=1, sticky="nsew", padx=10, pady=10)
+
+        ctk.CTkLabel(f, text="历史日志检索", font=("Microsoft YaHei", 16, "bold")).pack(pady=10)
+        
+        # 1. 选择日志类型 (对应 log_file_name)
+        ctk.CTkLabel(f, text="选择服务类型:", font=("Arial", 11)).pack(pady=(10, 0))
+        self.log_type_var = ctk.StringVar(value="请选择类型")
+        # 动态包含你所有的服务 key
+        log_types = ["gateway", "error_watcher", "patrol", "janitor", "tag_updater", "debug_tools"]
+        self.log_type_menu = ctk.CTkOptionMenu(f, values=log_types, variable=self.log_type_var, 
+                                              command=self.refresh_log_file_list)
+        self.log_type_menu.pack(pady=10, padx=20)
+
+        # 2. 选择具体日期文件
+        ctk.CTkLabel(f, text="选择日期文件:", font=("Arial", 11)).pack(pady=(10, 0))
+        self.log_file_var = ctk.StringVar(value="请先选择类型")
+        self.log_file_menu = ctk.CTkOptionMenu(f, values=[], variable=self.log_file_var)
+        self.log_file_menu.pack(pady=10, padx=20)
+
+        # 3. 功能按钮
+        ctk.CTkButton(f, text="读取全量内容", command=self.load_log_content).pack(pady=20, padx=30)
+        ctk.CTkButton(f, text="📂 打开日志目录", fg_color="gray30", command=self.open_log_dir).pack(pady=5, padx=30)
+        
+        ctk.CTkLabel(f, text="* 物理日志实时写入，\n界面仅显示最新动态。", 
+                     font=("Arial", 10), text_color="gray").pack(side="bottom", pady=20)
+
+    def refresh_log_file_list(self, choice):
+        """根据选中的服务类型，扫描 logs 文件夹下的对应日期文件"""
+        if not self.log_dir.exists(): return
+        # 匹配 key_YYYY-MM-DD.log 格式的文件
+        files = [f for f in os.listdir(self.log_dir) if f.startswith(choice) and f.endswith(".log")]
+        files.sort(reverse=True) # 最近的日期排在最上面
+        
+        if files:
+            self.log_file_menu.configure(values=files)
+            self.log_file_var.set(files[0])
+        else:
+            self.log_file_menu.configure(values=["暂无历史日志"])
+            self.log_file_var.set("暂无历史日志")
+
+    def load_log_content(self):
+        """物理读取硬盘文件并渲染到展示区"""
+        filename = self.log_file_var.get()
+        if "暂无" in filename or "请选择" in filename: return
+        
+        path = self.log_dir / filename
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+                self.viewer_log.delete("1.0", "end")
+                self.viewer_log.insert("end", content)
+                self.viewer_log.see("end") # 自动滚动到底部
+        except Exception as e:
+            self.viewer_log.insert("end", f"\n[X] 日志读取失败: {e}")
+
+    def open_log_dir(self):
+        """一键直达 logs 文件夹"""
+        if os.name == 'nt': os.startfile(self.log_dir)
 
 if __name__ == "__main__":
     app = ComicControlApp()
