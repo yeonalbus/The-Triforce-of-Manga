@@ -59,9 +59,11 @@ class FolderInspector:
 
         # 2. 动态增加本次维护所需的标记位
         new_columns = [
-            ("need_destroy", "INTEGER DEFAULT 0"),     # 1 表示建议销毁，0 表示正常
-            ("need_update_tag", "INTEGER DEFAULT 0")   # 1 表示需要更新 Tag，0 表示已同步
-        ]
+                ("need_destroy", "INTEGER DEFAULT 0"),
+                ("need_update_tag", "INTEGER DEFAULT 0"),
+                ("pub_date", "TEXT"),    # YYYY-MM-DD
+                ("language", "TEXT")     # zh 或 ja
+            ]
 
         for col_name, col_def in new_columns:
             try:

@@ -71,13 +71,19 @@ class KomgaToCalibre:
                 # --- 步骤 3：调用 Calibre (耗时操作，不占锁) ---
                 import xml.etree.ElementTree as ET
                 root = ET.fromstring(xml_data)
+
+                pub_date = info['pub_date'] if info['pub_date'] else f"{root.findtext('Year', '2000')}-01-01"
+                lang = info['language'] if info['language'] else "ja"
+
                 cmd = [
                     config.CALIBREDB_EXE, "add", temp_cbz_final,
                     "--with-library", config.TARGET_DIR,
                     "--authors", root.findtext('Artist', 'Unknown'),
                     "--title", root.findtext('Title', 'Unknown'),
                     "--tags", root.findtext('Tags', ''),
-                    "--series", root.findtext('Title', 'Unknown'), 
+                    "--series", root.findtext('Title', 'Unknown'),
+                    "--date", pub_date,
+                    "--languages", lang,
                     "--duplicates"
                 ]
 
@@ -89,7 +95,6 @@ class KomgaToCalibre:
                     encoding='utf-8',
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
-                res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8')
                 
                 if res.returncode == 0:
                     cid_match = re.search(r'id:?\s*(\d+)', res.stdout + res.stderr, re.IGNORECASE)
