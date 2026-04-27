@@ -70,12 +70,13 @@ class TagUpdater:
             return None, None
 
     def update_cbz_comicinfo(self, cbz_path, translated_tags):
-        """注入物理 CBZ 内部的 ComicInfo.xml"""
+        """物理 CBZ 内部 ComicInfo.xml 的安全覆盖注入"""
         if not os.path.exists(cbz_path): return False
         
+        temp_cbz = cbz_path + ".tmp"
         temp_xml = "ComicInfo.xml"
         try:
-            # 读取旧 XML 或创建新结构
+            # 1. 提取并准备新的 XML 内容
             root = None
             with zipfile.ZipFile(cbz_path, 'r') as z:
                 if "ComicInfo.xml" in z.namelist():
@@ -83,24 +84,27 @@ class TagUpdater:
                     root = ET.fromstring(content)
             
             if root is None: root = ET.Element("ComicInfo")
-
-            # 更新 Tags 节点
             tags_node = root.find("Tags")
             if tags_node is None: tags_node = ET.SubElement(root, "Tags")
             tags_node.text = translated_tags
-            
-            # 格式化并写入
             xml_str = minidom.parseString(ET.tostring(root, 'utf-8')).toprettyxml(indent="  ")
-            with open(temp_xml, "w", encoding="utf-8") as f: f.write(xml_str)
 
-            # 更新回压缩包
-            with zipfile.ZipFile(cbz_path, 'a') as z:
-                z.write(temp_xml, "ComicInfo.xml")
-            
-            os.remove(temp_xml)
+            # 2. 重建压缩包：过滤掉旧的 ComicInfo.xml
+            with zipfile.ZipFile(cbz_path, 'r') as zin:
+                with zipfile.ZipFile(temp_cbz, 'w', zipfile.ZIP_STORED) as zout:
+                    # 写入新的 XML
+                    zout.writestr("ComicInfo.xml", xml_str)
+                    # 复制其他所有文件
+                    for item in zin.infolist():
+                        if item.filename != 'ComicInfo.xml':
+                            zout.writestr(item, zin.read(item.filename))
+
+            # 3. 原子化替换
+            os.replace(temp_cbz, cbz_path)
             return True
         except Exception as e:
             print(f"    [X] CBZ 注入失败: {e}")
+            if os.path.exists(temp_cbz): os.remove(temp_cbz)
             return False
 
     def refresh_komga_metadata(self, kid):
@@ -151,7 +155,8 @@ class TagUpdater:
                         config.CALIBREDB_EXE, "set_metadata", str(row['calibre_id']),
                         "--with-library", config.TARGET_DIR,
                         "--field", f"tags:{tags_arg}"
-                    ], capture_output=True, check=True)
+                    ], capture_output=True, check=True, 
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0) # 注入隐身符
                     print(f"    [√] Calibre 数据库已同步 (ID: {row['calibre_id']})")
                 except Exception as e:
                     print(f"    [X] Calibre 更新失败: {e}")
