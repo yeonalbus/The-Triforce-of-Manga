@@ -70,6 +70,19 @@ class ComicControlApp:
         os.makedirs(self.log_dir, exist_ok=True)
         self.MAX_UI_LINES = 20  # 界面显示上限，超过则滚动删除旧行
 
+    def _force_cleanup_db_lock(self):
+        """物理清除残留的数据库锁"""
+        # 这里直接复用 db_locker 里的逻辑获取路径
+        lock_path = Path(config.SYNC_DB_PATH).parent / ".lock"
+        if lock_path.exists():
+            try:
+                os.remove(lock_path)
+                # 这里的 log_to 会根据你当前的 tab 自动显示
+                return True
+            except:
+                pass
+        return False
+
     def setup_layout(self):
         self.window.grid_columnconfigure(1, weight=1)
         self.window.grid_rowconfigure(0, weight=1)
@@ -247,18 +260,18 @@ class ComicControlApp:
     def run_pipeline(self):
         self.inc_log.delete("0.0", "end")
         def _pipe():
-            self.log_to(self.inc_log, "==== 开启全自动同步流水线 ====")
+            self.log_to(self.inc_log, "==== 开启全自动同步流水线 ====", max_lines=None)
             for name, path in self.pipeline_steps:
                 if not self.window.winfo_exists(): break
-                self.log_to(self.inc_log, f"--> 正在执行: {name}")
+                self.log_to(self.inc_log, f"--> 正在执行: {name}", max_lines=None)
                 self.current_task_proc = self._safe_popen([sys.executable, "-u", str(_SCRIPTS_DIR / path)])
                 for line in iter(self.current_task_proc.stdout.readline, ''):
-                    self.log_to(self.inc_log, f"  {line.strip()}")
+                    self.log_to(self.inc_log, f"  {line.strip()}", max_lines=None)
                 self.current_task_proc.wait()
                 if self.current_task_proc is None or self.current_task_proc.returncode != 0:
-                    self.log_to(self.inc_log, "[X] 流程异常或被手动中断")
+                    self.log_to(self.inc_log, "[X] 流程异常或被手动中断", max_lines=None)
                     return
-            self.log_to(self.inc_log, "==== 流程全部圆满完成 ====")
+            self.log_to(self.inc_log, "==== 流程全部圆满完成 ====", max_lines=None)
             self.current_task_proc = None
         threading.Thread(target=_pipe, daemon=True).start()
 
@@ -266,10 +279,10 @@ class ComicControlApp:
         if self.current_step_index >= len(self.pipeline_steps): return
         name, path = self.pipeline_steps[self.current_step_index]
         def _task():
-            self.log_to(self.inc_log, f">>> 手动步骤启动: {name}")
+            self.log_to(self.inc_log, f">>> 手动步骤启动: {name}", max_lines=None)
             self.current_task_proc = self._safe_popen([sys.executable, "-u", str(_SCRIPTS_DIR / path)])
             for line in iter(self.current_task_proc.stdout.readline, ''):
-                self.log_to(self.inc_log, f"    {line.strip()}")
+                self.log_to(self.inc_log, f"    {line.strip()}", max_lines=None)
             self.current_task_proc.wait()
             self.current_task_proc = None
 
@@ -334,11 +347,11 @@ class ComicControlApp:
         
         def _task():
             # 记录到 debug 专用的持久化文件
-            self.log_to(self.debug_log, f">>> 触发单次执行: {script_name}", log_file_name="debug_tools")
+            self.log_to(self.debug_log, f">>> 触发单次执行: {script_name}", log_file_name="debug_tools", max_lines=None)
             # 这里统一使用 subprocess 执行，不带额外 args [cite: 29]
             self.current_task_proc = self._safe_popen([sys.executable, "-u", str(full_path)])
             for line in iter(self.current_task_proc.stdout.readline, ''):
-                self.log_to(self.debug_log, f"    {line.strip()}", log_file_name="debug_tools")
+                self.log_to(self.debug_log, f"    {line.strip()}", log_file_name="debug_tools", max_lines=None)
             if self.current_task_proc:
                 self.current_task_proc.wait() # [cite: 30]
             self.current_task_proc = None
@@ -355,7 +368,7 @@ class ComicControlApp:
         self.active_subprocesses.append(proc) # [cite: 10]
         return proc
 
-    def log_to(self, text_widget, message, log_file_name=None):
+    def log_to(self, text_widget, message, log_file_name=None, max_lines=20):
         timestamp = time.strftime('%H:%M:%S')
         formatted_msg = f"[{timestamp}] {message}\n"
 
@@ -371,17 +384,14 @@ class ComicControlApp:
         # 2. 线程安全地更新 UI
         def _write():
             if not text_widget.winfo_exists(): return
-            
-            # 插入新内容
             text_widget.insert("end", formatted_msg)
             
-            # 检查行数并清理 (关键优化)
-            # 获取当前行数（index 'end' 返回 "line.char" 格式）
-            line_count = int(text_widget.index('end-1c').split('.')[0])
-            if line_count > self.MAX_UI_LINES:
-                # 删除从第一行到溢出部分的文本，保持总量在 MAX_UI_LINES
-                delete_until = float(line_count - self.MAX_UI_LINES + 1)
-                text_widget.delete("1.0", f"{delete_until}.0")
+            # --- 改进后的行数清理逻辑 ---
+            if max_lines is not None:
+                line_count = int(text_widget.index('end-1c').split('.')[0])
+                if line_count > max_lines:
+                    delete_until = float(line_count - max_lines + 1)
+                    text_widget.delete("1.0", f"{delete_until}.0")
             
             text_widget.see("end")
 
@@ -389,9 +399,15 @@ class ComicControlApp:
 
     def interrupt_task(self, log_widget):
         if self.current_task_proc and self.current_task_proc.poll() is None:
-            self.current_task_proc.terminate() # [cite: 25]
-            self.log_to(log_widget, "!!! [手动中断] 任务已强行终止") # [cite: 26]
+            self.current_task_proc.terminate()
+            self.current_task_proc.wait() # 等待进程彻底退出
             self.current_task_proc = None
+            
+            # 关键：强行清理
+            if self._force_cleanup_db_lock():
+                self.log_to(log_widget, "!!! [手动中断] 任务已强行终止，残留锁已同步清理")
+            else:
+                self.log_to(log_widget, "!!! [手动中断] 任务已强行终止")
 
     def show_frame(self, name):
         for f in self.tab_frames.values(): f.grid_forget()
